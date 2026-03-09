@@ -7,6 +7,8 @@ Stars are queried from Gaia, LS, PS1 (in that order), and 2MASS for the IR
 
 usage:
 
+git clone git@github.com:tahumada/soar-finder.git
+
 cd /path/to/soar-finder/
 
 python finder.py --ra XX  --dec XX*  --source-name XX
