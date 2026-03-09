@@ -8,6 +8,7 @@ Stars are queried from Gaia, LS, PS1 (in that order), and 2MASS for the IR
 usage:
 
 cd /path/to/soar-finder/
+
 python finder.py --ra XX  --dec XX*  --source-name XX
 
 Replace XX with the values of RA, Dec, and the source name
