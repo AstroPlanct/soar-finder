@@ -5,7 +5,8 @@ When optical surveys are requested it queries LS, PS1, DECaPs, DSS (in that orde
 
 Stars are queried from Gaia, LS, PS1 (in that order), and 2MASS for the IR
 
-usage:\\
+usage:
+
 cd /path/to/soar-finder/
 python finder.py --ra XX  --dec XX*  --source-name XX
 
