@@ -3,7 +3,7 @@
 Script to download finders for the SOAR telescope.
 When optical surveys are requested it queries LS, PS1, DECaPs, DSS (in that order), and for IR surveys it querues 2MASS.
 
-Stars are queried from Gaia, LS, PS1 (in that order, and 2MASS for the IR
+Stars are queried from Gaia, LS, PS1 (in that order), and 2MASS for the IR
 
 usage:
 python finder.py --ra XX  --dec XX*  --source-name XX
