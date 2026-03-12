@@ -1,442 +1,399 @@
-# todo - the finder when applied PA is turned the other way around
-
-# Standard library
-import io
-import os
-import math
-import re
-from io import BytesIO
+# Import library to parse command-line arguments
+import argparse
+# Import Path to handle cross-platform file paths safely
 from pathlib import Path
+# Import warnings to silence excessive console output from Astropy
+import warnings
+# Import ThreadPoolExecutor to enable parallel downloads
+from concurrent.futures import ThreadPoolExecutor
 
-# Third-party
+# Import numpy for numerical operations and array handling
 import numpy as np
+# Import matplotlib main library to change global parameters
 import matplotlib as mpl
+# Import pyplot for plotting graphs and images
 import matplotlib.pyplot as plt
-import requests
+# Import Circle and Rectangle to draw the Field of View and Slit
+from matplotlib.patches import Circle, Rectangle
 
-# Astropy
+# Import Astropy units for handling physical quantities like degrees
 import astropy.units as u
-from astropy.coordinates import SkyCoord, Angle
-from astropy.io import fits
-from astropy.time import Time
+# Import SkyCoord to handle astronomical coordinates
+from astropy.coordinates import SkyCoord
+# Import WCS to handle World Coordinate System transformations
 from astropy.wcs import WCS
+# Import Astropy warnings to properly filter them
+from astropy.utils.exceptions import AstropyWarning
+# Import visualization tools to adjust image contrast
 from astropy.visualization import ImageNormalize, ZScaleInterval
 
-# Reproject
+# Import reproject to align image data to a new WCS
 from reproject import reproject_interp
 
-# utils
-from utils import query_stars_gaia, query_stars_ps1, query_stars_ls, get_stars_2mass
-from utils import get_url, parse_coords
-from utils import get_image_ps1, get_image_ls, get_image_decaps, get_image_dss, get_image_2mass,get_image_fallbacks
-from utils import setup_logger
+# Import custom functions from the local utils.py module
+from utils import (
+    query_stars_gaia, query_stars_ps1, query_stars_ls, get_stars_2mass,
+    parse_coords, get_image_2mass, get_image_fallbacks, setup_logger, upload_to_drive
+)
 
+# Silence all Astropy and general user warnings for a clean terminal output
+warnings.simplefilter('ignore', category=AstropyWarning)
+warnings.simplefilter('ignore', category=UserWarning)
 
-# Matplotlib defaults
-mpl.rcParams["font.size"] = 15  # default = 10.0
-    
+# Set the global font size default for matplotlib plots to 15
+mpl.rcParams["font.size"] = 15
 
-def get_stars_optical(ra,dec,radius=3):
-    stars = query_stars_gaia(ra,dec,radius=radius)
-    if len(stars) != 0:
-        print('Star catalog from Gaia')
-    if len(stars) == 0 and dec > -30:
-        stars = query_stars_ps1(ra,dec,radius=radius)
-        if len(stars) != 0:
-            print('Star catalog from PS1')
-    if len(stars) == 0 and dec < 30:
-        stars = query_stars_ls(ra,dec,radius=radius)
-        if len(stars) != 0:
-            print('Star catalog from LS')
-    if len(stars) == 0:
-        print('Failed to retrieve stars')
-        return ''
-        
-    return stars
+# Define function to retrieve stars from optical catalogs with automatic failover
+def get_stars_optical(ra, dec, radius=3):
+    # 1. Try Gaia first
+    try:
+        stars = query_stars_gaia(ra, dec, radius=radius)
+        if not stars.empty:
+            print('Star catalog from Gaia')
+            return stars
+    except Exception as e:
+        print(f"⚠️ Warning: Gaia query failed. ({e}). Trying PS1...")
 
-def get_stars (ra,dec,radius=3,wv = 'optical'):
-    
+    # 2. Try Pan-STARRS 1 (valid for declinations greater than -30)
+    if dec > -30:
+        try:
+            stars = query_stars_ps1(ra, dec, radius=radius)
+            if not stars.empty:
+                print('Star catalog from PS1')
+                return stars
+        except Exception as e:
+            print(f"⚠️ Warning: PS1 query failed. ({e}). Trying LS...")
+
+    # 3. Try Legacy Survey (valid for declinations less than 30)
+    if dec < 30:
+        try:
+            stars = query_stars_ls(ra, dec, radius=radius)
+            if not stars.empty:
+                print('Star catalog from LS')
+                return stars
+        except Exception as e:
+            print(f"⚠️ Warning: LS query failed. ({e}).")
+
+    # 4. If all catalogs fail
+    print('❌ Could not retrieve reference stars from any optical catalog.')
+    return ''
+
+# Define function to select the appropriate star catalog based on wavelength
+def get_stars(ra, dec, radius=3, wv='optical'):
     if wv == 'optical':
-        stars = get_stars_optical(ra,dec,radius=3)
-    
+        stars = get_stars_optical(ra, dec, radius=radius)
     elif wv == 'ir':
-        stars = get_stars_2mass(ra,dec,radius=radius)
-        if len(stars) != 0:
+        stars = get_stars_2mass(ra, dec, radius=radius)
+        if not stars.empty:
             print('Star catalog from 2MASS')
-        
-        if len(stars) == 0:
+        else:
             print('Failed to retrieve stars from 2MASS, trying optical surveys')
-            stars = get_stars_optical(ra,dec,radius=3)
+            stars = get_stars_optical(ra, dec, radius=radius)
     else:
-        print(f'{wv} wavelenght not supported')
+        print(f'{wv} wavelength not supported')
         return ''
         
-    # add offset columns
-    if len(stars) == 0:
+    if isinstance(stars, str) or stars.empty:
         return ''
         
-    target = SkyCoord(ra*u.deg, dec*u.deg, frame="icrs")
-    coords = SkyCoord(stars["ra"].values*u.deg,
-                       stars["dec"].values*u.deg,
-                       frame="icrs")
+    target = SkyCoord(ra * u.deg, dec * u.deg, frame="icrs")
+    coords = SkyCoord(stars["ra"].values * u.deg, stars["dec"].values * u.deg, frame="icrs")
     
-    # Offsets: dra = East-West, ddec = North-South
-    dra, ddec = coords.spherical_offsets_to(target)
+    dra, ddec = target.spherical_offsets_to(coords)
     stars["offset_EW_arcsec"] = dra.to(u.arcsec).value
     stars["offset_NS_arcsec"] = ddec.to(u.arcsec).value
 
     return stars
 
-
-
-def fits2image_projected(hdu,pa_deg=0,imsize = 6,radius = 3):
-
-    watermark = hdu[0].header['watermark']
-    imsize = hdu[0].header['imsize']
-    pixscale = hdu[0].header['pixscale']
-    source_name = hdu[0].header['source_name']
-    ra = hdu[0].header['ra']
-    dec = hdu[0].header['dec']
-    npixels = hdu[0].header['numpix']
-    
-    fig = plt.figure(figsize=(11, 8.5), constrained_layout=False)
-    widths = [2.6, 1]
-    heights = [2.6, 1]
-    spec = fig.add_gridspec(
-        ncols=2,
-        nrows=1,
-        width_ratios=widths,
-        # height_ratios=heights,
-        left=0.05,
-        right=0.95,
-    )
-    
-    
-    wcs = WCS(naxis=2)
-    
-    # set the headers of the WCS.
-    # The center of the image is the reference point (source_ra, source_dec):
-    wcs.wcs.crpix = [npixels / 2, npixels / 2]
-    wcs.wcs.crval = [ra, dec]
-    
-    # create the pixel scale and orientation North up, East left
-    # pixelscale is in degrees, established in the tangent plane
-    # to the reference point
-    
-    wcs.wcs.cd = np.array([[-pixscale / 3600, 0], [0, pixscale / 3600]])
-    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
-    
-    im = hdu[0].data
-    ######## rotate
-    if pa_deg != 0:
-        pa_rad = np.deg2rad(360-pa_deg)
-        
-        # Copy WCS
-        new_wcs = wcs.deepcopy()
-        
-        # Rotation matrix (PC matrix)
-        rot = np.array([
-            [ np.cos(pa_rad), -np.sin(pa_rad)],
-            [ np.sin(pa_rad),  np.cos(pa_rad)]
-        ])
-        
-        new_wcs.wcs.cd = rot @ wcs.wcs.cd
-        
-        reproj_data, footprint = reproject_interp(
-            (hdu[0].data, wcs),
-            new_wcs,
-            shape_out=hdu[0].data.shape
-        )
-        
-        im = reproj_data
-        
-    else:
-        new_wcs = wcs.deepcopy()
-    
-    # replace the nans with medians
-    im[np.isnan(im)] = np.nanmedian(im)
-    
-    # Fix the header keyword for the input system, if needed
-    hdr = hdu[0].header
-    if "RADECSYS" in hdr:
-        hdr.set("RADESYSa", hdr["RADECSYS"], before="RADECSYS")
-        del hdr["RADECSYS"]
-    
-    wcs = WCS(hdu[0].header)
-    
-    zscale_contrast=0.045
-    zscale_krej=2.5
-    
-    cent = int(npixels / 2)
-    width = int(0.05 * npixels)
-    test_slice = slice(cent - width, cent + width)
-    all_nans = np.isnan(im[test_slice, test_slice].flatten()).all()
-    all_zeros = (im[test_slice, test_slice].flatten() == 0).all()
-    if not (all_zeros or all_nans):
-        percents = np.nanpercentile(im.flatten(), [10, 99.0])
-        vmin = percents[0]
-        vmax = percents[1]
-        interval = ZScaleInterval(
-            nsamples=int(0.1 * (im.shape[0] * im.shape[1])),
-            contrast=zscale_contrast,
-            krej=zscale_krej,
-        )
-        norm = ImageNormalize(im, vmin=vmin, vmax=vmax, interval=interval)
-        watermark = watermark 
-        fallback = False
-    else:
-        print(im)
-        raise TypeError('Downloaded an empty image')
-    # add the images in the top left corner
-    ax = fig.add_subplot(spec[0, 0], projection=new_wcs)
-    ax_text = fig.add_subplot(spec[0, 1])
-    ax_text.axis("off")
-    
-    ax.imshow(im, origin="lower", norm=norm, cmap="gray_r")
-    ax.set_autoscale_on(False)
-    ax.grid(color="white", ls="dotted")
-    ax.set_xlabel(r"$\alpha$ (J2000)", fontsize="large")
-    ax.set_ylabel(r"$\delta$ (J2000)", fontsize="large")
-    ax.set_title(
-    f"{source_name} Finder",
-    fontsize="large",
-    fontweight="bold",
-    )
-
-    # plot hair cross for the target
-
-    coord = SkyCoord(ra*u.deg, dec*u.deg, frame="icrs")
-    ra_str  = coord.ra.to_string(unit=u.hour, sep=":", precision=2)
-    dec_str = coord.dec.to_string(unit=u.deg, sep=":", precision=1, alwayssign=True)
-
-    x, y = new_wcs.world_to_pixel(coord)
-    color_target = "#D55E00"
-    arm_len = 30     # length of each arm (pixels)
-    gap = 15          # half-gap at center (pixels)
-    lw = 4
-    mag = "?"
-    offset_ra, offset_dec = 0,0
-
-    star_text = (
-            rf"$\bf{{{source_name}}} - {mag}$ mag"
-            f'\n{coord.ra.deg:.6f} {coord.dec.deg:.6f}\n'
-            f'{ra_str} {dec_str} \n'
-            f'{round(offset_ra,4) } {round(offset_dec,4)}'
-           )
-    
-    ax.plot([x + gap, x + arm_len], [y, y], color=color_target, lw=lw)
-    ax.plot([x, x], [y + gap, y + arm_len], color=color_target, lw=lw)
-    ax_text.text(0,
-                 1 - (0.5) / 4,
-                 star_text,
-                color = color_target)
-    ####
-    # getting stars
-    stars = get_stars(ra,dec,radius=radius,wv=hdu[0].header['wv'])
-   
-    if len(stars) != 0:
-        
-        top3 = stars.iloc[:3]
-        
-        colors = [
-        "#E69F00",  # orange
-        "#56B4E9",  # sky blue
-        "#009E73",  # bluish green
-        ]  # any colors you want
-    
-        top3_colors = {}
-        
-        arm_len = 30     # length of each arm (pixels)
-        gap = 15          # half-gap at center (pixels)
-        lw = 3
-    
-    
-        for i, (idx, row) in enumerate(top3.iterrows()):
-            coord = SkyCoord(row.ra*u.deg, row.dec*u.deg, frame="icrs")
-            x, y = new_wcs.world_to_pixel(coord)        
-            ra_str  = coord.ra.to_string(unit=u.hour, sep=":", precision=2)
-            dec_str = coord.dec.to_string(unit=u.deg, sep=":", precision=1, alwayssign=True)
-    
-            mag = row.mag
-            
-            offset_ra, offset_dec = row.offset_EW_arcsec,row.offset_NS_arcsec
-            EW, NS = 'E', 'N'
-            if offset_ra < 0 : 
-                EW = 'W'
-            if offset_dec < 0 : 
-                NS = 'S'
-                
-            c = colors[i]
-            top3_colors[idx] = c
-            
-            star_text = (
-                    rf"$\bf{{{source_name}-{str(i+1)}}}$  {mag:.2f} mag g-band "
-                    # f'\n{coord.ra.deg:.6f} {coord.dec.deg:.6f}\n'
-                    f'\n {ra_str} {dec_str} \n'
-                    f'offset RA, Dec: {round(np.abs(offset_ra),2)} {EW} {round(np.abs(offset_dec),2)} {NS}'
-                   )
-        
-            c = colors[i]
-            top3_colors[idx] = c
-        
-            # Horizontal arms
-            ax.plot([x - arm_len, x - gap], [y, y], color=c, lw=lw)
-            ax.plot([x + gap, x + arm_len], [y, y], color=c, lw=lw)
-        
-            # Vertical arms
-            ax.plot([x, x], [y - arm_len, y - gap], color=c, lw=lw)
-            ax.plot([x, x], [y + gap, y + arm_len], color=c, lw=lw)
-        
-        # add text on the side
-            ax_text.text(0,
-                         1 - ((i+1) + 0.5) / 4,
-                         star_text,
-                         color = c)
-            print(star_text)
-
-    
-    # compass rose
-
-    theta = np.deg2rad(360-pa_deg)
-    length = 60
-    lw = 2.5
+# Modular Plotting Function: Draw a North-East compass rose
+def add_compass_rose(ax, visible_size, cx, cy, wcs, is_rotated=False):
+    length = visible_size * 0.08
     gold = "#E69F00"
+    margin = visible_size * 0.10
     
-    x0, y0 = int(npixels * 0.1), int(npixels * 0.87)
+    if not is_rotated:
+        x0 = (cx - visible_size / 2) + margin
+        y0 = (cy + visible_size / 2) - margin
+    else:
+        x0 = (cx + visible_size / 2) - margin
+        y0 = (cy - visible_size / 2) + margin
+        
+    pix_origin = wcs.wcs.crpix
+    world_origin = SkyCoord(wcs.wcs.crval[0] * u.deg, wcs.wcs.crval[1] * u.deg, frame="icrs")
     
-    # Rotation matrix
-    R = np.array([
-        [ np.cos(theta), -np.sin(theta)],
-        [ np.sin(theta),  np.cos(theta)]
-    ])
+    p_n = world_origin.directional_offset_by(0 * u.deg, 1 * u.arcmin)
+    pix_n = wcs.world_to_pixel(p_n)
+    dx_n, dy_n = pix_n[0] - pix_origin[0], pix_n[1] - pix_origin[1]
     
-    # Unit vectors
-    N0 = np.array([0, 1])
-    E0 = np.array([-1, 0])
+    p_e = world_origin.directional_offset_by(90 * u.deg, 1 * u.arcmin)
+    pix_e = wcs.world_to_pixel(p_e)
+    dx_e, dy_e = pix_e[0] - pix_origin[0], pix_e[1] - pix_origin[1]
+
+    def norm_v(dx, dy):
+        mag = np.sqrt(dx**2 + dy**2)
+        return (dx / mag) * length, (dy / mag) * length if mag != 0 else (0, 0)
+
+    dnx, dny = norm_v(dx_n, dy_n)
+    dex, dey = norm_v(dx_e, dy_e)
+
+    ax.arrow(x0, y0, dnx, dny, color=gold, width=visible_size*0.002, head_width=visible_size*0.015, zorder=20)
+    ax.text(x0 + dnx*1.6, y0 + dny*1.6, "N", color=gold, ha="center", va="center", fontweight="bold", zorder=20)
     
-    # Rotated vectors
-    dx_N, dy_N = length * (R @ N0)
-    dx_E, dy_E = length * (R @ E0)
+    ax.arrow(x0, y0, dex, dey, color=gold, width=visible_size*0.002, head_width=visible_size*0.015, zorder=20)
+    ax.text(x0 + dex*1.6, y0 + dey*1.6, "E", color=gold, ha="center", va="center", fontweight="bold", zorder=20)
+
+# Modular Plotting Function: Draw symmetrical crosshairs
+def draw_crosshair(ax, x, y, gap, arm, color, label=None, label_offset=0):
+    ax.plot([x + gap, x + arm], [y, y], color=color, lw=3 if not label else 2)
+    ax.plot([x - arm, x - gap], [y, y], color=color, lw=3 if not label else 2)
+    ax.plot([x, x], [y + gap, y + arm], color=color, lw=3 if not label else 2)
+    ax.plot([x, x], [y - arm, y - gap], color=color, lw=3 if not label else 2)
+    if label:
+        ax.text(x + arm + label_offset, y + arm + label_offset, label, color=color, fontsize=12, fontweight='bold')
+
+# Modular Plotting Function: Draw scale bar (Updated to fix overlapping text)
+def draw_scale_bar(ax, cx, cy, target_npix, pixscale, is_rotated=False):
+    bar_px = 60 / pixscale
+    bx0 = (cx - target_npix/2) + (target_npix * 0.05)
+    by0 = (cy - target_npix/2) + (target_npix * 0.05)
+    ax.plot([bx0, bx0 + bar_px], [by0, by0], color='blue', lw=3)
     
-    # Plot North
-    ax.plot([x0, x0 + dx_N], [y0, y0 + dy_N],
-            color=gold, lw=lw)
-    ax.text(x0 + dx_N*1.4, y0 + dy_N*1.4, "N",
-            color=gold, ha="center", va="center")
+    # Adjust text position depending on rotation to avoid overlapping the line
+    if is_rotated:
+        ax.text(bx0 + bar_px/2, by0 + (target_npix * 0.03), "1'", color='blue', ha='center', va='top', fontweight='bold')
+    else:
+        ax.text(bx0 + bar_px/2, by0 + (target_npix * 0.03), "1'", color='blue', ha='center', va='bottom', fontweight='bold')
+
+# Define main function to build the figure from FITS files
+def fits2image_projected(hdu_opt, hdu_ir, stars_opt, stars_ir, pa_deg=0, imsize=6, radius=3, contrast=0.045):
+    fig = plt.figure(figsize=(22, 16), constrained_layout=False)
+    spec = fig.add_gridspec(ncols=3, nrows=2, width_ratios=[4, 4, 2.8], height_ratios=[1, 1],
+                            left=0.05, right=0.95, wspace=0.15, hspace=0.2)
+
+    ax_text = fig.add_subplot(spec[:, 2])
+    ax_text.axis("off")
+
+    base_hdu = hdu_opt if hdu_opt else hdu_ir
+    s_name = base_hdu[0].header['s_name']
+    base_ra, base_dec = base_hdu[0].header['ra'], base_hdu[0].header['dec']
     
-    # Plot East
-    ax.plot([x0, x0 + dx_E], [y0, y0 + dy_E],
-            color=gold, lw=lw)
-    ax.text(x0 + dx_E*1.4, y0 + dy_E*1.4, "E",
-            color=gold, ha="center", va="center")
+    # Emphasis on Target Name and Coordinates
+    ax_text.text(0, 0.97, f"TARGET: {s_name}", color="#8B0000", fontsize=22, fontweight="bold")
+    ax_text.text(0, 0.92, f"RA: {base_ra:.5f}\nDEC: {base_dec:.5f}", color="#000080", fontsize=16, fontweight="bold")
+
+    # Sub-function to plot individual ROW (Optical top, IR bottom)
+    def plot_row(hdu, row_idx, catalog_name, filter_name, prefix_dir, prefix_rot, text_y_start, color_dir, color_rot, num_dir, num_rot, stars_df):
+        pixscale = hdu[0].header['pixscale']
+        ra, dec = hdu[0].header['ra'], hdu[0].header['dec']
+        npixels = hdu[0].header['numpix']
+        
+        wcs = WCS(naxis=2)
+        wcs.wcs.crpix, wcs.wcs.crval = [npixels / 2, npixels / 2], [ra, dec]
+        wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        
+        pa_rad = np.deg2rad(pa_deg)
+        rot = np.array([[np.cos(pa_rad), np.sin(pa_rad)], [-np.sin(pa_rad), np.cos(pa_rad)]])
+        wcs.wcs.cd = rot @ np.array([[-pixscale / 3600, 0], [0, pixscale / 3600]])
+
+        im, _ = reproject_interp((hdu[0].data, WCS(hdu[0].header)), wcs, shape_out=(npixels, npixels))
+        
+        # Protection against completely empty images (outside the catalog's coverage area)
+        if np.all(np.isnan(im)):
+            print(f"⚠️ Warning: The image for {catalog_name} is empty (possibly outside coverage area).")
+            im = np.zeros((int(npixels), int(npixels))) # Creates a black background
+            norm = None
+        else:
+            im[np.isnan(im)] = np.nanmedian(im)
+            try:
+                norm = ImageNormalize(im, interval=ZScaleInterval(contrast=contrast))
+            except IndexError:
+                # Fallback in case the image has data but is completely flat
+                norm = None
+
+        ax_dir = fig.add_subplot(spec[row_idx, 0], projection=wcs)
+        ax_rot = fig.add_subplot(spec[row_idx, 1], projection=wcs)
+
+        target_npix = (imsize * 60) / pixscale
+        cx, cy = npixels / 2, npixels / 2
+
+        for plot_ax in [ax_dir, ax_rot]:
+            plot_ax.imshow(im, origin="lower", norm=norm, cmap="gray_r")
+            plot_ax.set_autoscale_on(False)
+            
+            plot_ax.coords[0].set_major_formatter('hh:mm:ss')
+            plot_ax.coords[1].set_major_formatter('dd:mm:ss')
+            
+            if plot_ax == ax_rot:
+                plot_ax.invert_xaxis()
+                plot_ax.invert_yaxis()
+                plot_ax.set_xlim(cx + target_npix/2, cx - target_npix/2)
+                plot_ax.set_ylim(cy + target_npix/2, cy - target_npix/2)
+                plot_ax.set_title(f"{num_rot} | {s_name} | {catalog_name} ({filter_name}) | PA: {(pa_deg + 180) % 360}°", color=color_rot, fontweight="bold", loc='right', fontsize=11)
+            else:
+                plot_ax.set_xlim(cx - target_npix/2, cx + target_npix/2)
+                plot_ax.set_ylim(cy - target_npix/2, cy + target_npix/2)
+                plot_ax.set_title(f"{num_dir} | {s_name} | {catalog_name} ({filter_name}) | PA: {pa_deg}°", color=color_dir, fontweight="bold", loc='right', fontsize=11)
+
+            plot_ax.grid(color="white", ls="dotted", alpha=0.5)
+            plot_ax.set_xlabel(r"$\alpha$ (J2000)", fontsize="large")
+            plot_ax.set_ylabel(r"$\delta$ (J2000)", fontsize="large")
+
+            add_compass_rose(plot_ax, target_npix, cx, cy, wcs, is_rotated=(plot_ax == ax_rot))
+
+            tx, ty = wcs.world_to_pixel(SkyCoord(ra * u.deg, dec * u.deg, frame="icrs"))
+            draw_crosshair(plot_ax, tx, ty, gap=4.0/pixscale, arm=12.0/pixscale, color="#D55E00")
+            plot_ax.add_patch(Circle((tx, ty), radius=1.0/pixscale, edgecolor='#D55E00', facecolor='none', lw=1.5, ls='--'))
+
+            # Spectrograph Slit Overlay (1.0" width x 4.0' height)
+            slit_w_px = 1.0 / pixscale
+            slit_h_px = 240.0 / pixscale # 4 arcminutes in arcseconds
+            # Since the array 'im' was generated with the Y-axis aligned to the PA, the slit is always vertical.
+            slit_rect = Rectangle((tx - slit_w_px/2, ty - slit_h_px/2), slit_w_px, slit_h_px, 
+                                  facecolor='green', edgecolor='lime', alpha=0.15, lw=1.5, zorder=5)
+            plot_ax.add_patch(slit_rect)
+
+        # Scale bars on both direct and rotated plots (passing is_rotated flag)
+        draw_scale_bar(ax_dir, cx, cy, target_npix, pixscale, is_rotated=False)
+        draw_scale_bar(ax_rot, cx, cy, target_npix, pixscale, is_rotated=True)
+
+        stars = stars_df
+        if not isinstance(stars, str) and not stars.empty:
+            # Intense colors for reference stars
+            top3, colors = stars.iloc[:3], ["#FFD700", "#00BFFF", "#FF00FF"]
+            
+            ax_text.text(0, text_y_start, f"{catalog_name} Ref Stars:", fontweight="bold", fontsize=12)
+            
+            s_gap, s_arm, t_offset = 2.5/pixscale, 7.0/pixscale, 3.0/pixscale
+
+            # --- DIRECT OFFSETS INFO (Table Format) ---
+            ax_text.text(0, text_y_start - 0.05, f"{num_dir} - Direct Offsets (PA: {pa_deg}°):", color=color_dir, fontweight="bold", fontsize=11)
+            for i, (_, row) in enumerate(top3.iterrows()):
+                sx, sy = wcs.world_to_pixel(SkyCoord(row.ra * u.deg, row.dec * u.deg, frame="icrs"))
+                draw_crosshair(ax_dir, sx, sy, gap=s_gap, arm=s_arm, color=colors[i], label=f"{prefix_dir}{i+1}", label_offset=t_offset)
+                
+                ew_dir = 'W' if row.offset_EW_arcsec >= 0 else 'E'
+                ns_dir = 'S' if row.offset_NS_arcsec >= 0 else 'N'
+                y_pos = text_y_start - 0.10 - (i * 0.045)
+                
+                # Column 1: Star Label
+                ax_text.text(0.00, y_pos, rf"$\bf{{{prefix_dir}{i+1}}}$", color=colors[i], fontsize=13)
+                # Column 2: Magnitude
+                ax_text.text(0.10, y_pos, f"{row.mag:.1f}m", color=colors[i], fontsize=13)
+                # Column 3: EW Offset (Bold and slightly larger to stand out)
+                ax_text.text(0.35, y_pos, rf"$\bf{{{abs(row.offset_EW_arcsec):.1f}''\ {ew_dir}}}$", color=colors[i], fontsize=14)
+                # Column 4: NS Offset (Bold and slightly larger to stand out)
+                ax_text.text(0.70, y_pos, rf"$\bf{{{abs(row.offset_NS_arcsec):.1f}''\ {ns_dir}}}$", color=colors[i], fontsize=14)
+
+            # --- ROTATED OFFSETS INFO (Table Format) ---
+            ax_text.text(0, text_y_start - 0.26, f"{num_rot} - Rotated Offsets (PA: {(pa_deg + 180) % 360}°):", color=color_rot, fontweight="bold", fontsize=11)
+            for i, (_, row) in enumerate(top3.iterrows()):
+                sx, sy = wcs.world_to_pixel(SkyCoord(row.ra * u.deg, row.dec * u.deg, frame="icrs"))
+                draw_crosshair(ax_rot, sx, sy, gap=s_gap, arm=s_arm, color=colors[i], label=f"{prefix_rot}{i+1}", label_offset=t_offset)
+                
+                ew_rot = 'E' if row.offset_EW_arcsec >= 0 else 'W'
+                ns_rot = 'N' if row.offset_NS_arcsec >= 0 else 'S'
+                y_pos = text_y_start - 0.31 - (i * 0.045)
+                
+                # Column 1: Star Label
+                ax_text.text(0.00, y_pos, rf"$\bf{{{prefix_rot}{i+1}}}$", color=colors[i], fontsize=13)
+                # Column 2: Magnitude
+                ax_text.text(0.10, y_pos, f"{row.mag:.1f}m", color=colors[i], fontsize=13)
+                # Column 3: EW Offset (Bold and slightly larger to stand out)
+                ax_text.text(0.35, y_pos, rf"$\bf{{{abs(row.offset_EW_arcsec):.1f}''\ {ew_rot}}}$", color=colors[i], fontsize=14)
+                # Column 4: NS Offset (Bold and slightly larger to stand out)
+                ax_text.text(0.70, y_pos, rf"$\bf{{{abs(row.offset_NS_arcsec):.1f}''\ {ns_rot}}}$", color=colors[i], fontsize=14)
+                
+            return text_y_start - 0.48
+        return text_y_start
+
+    # Adjust starting Y position to accommodate larger Target header
+    current_y = 0.83
     
+    if hdu_opt:
+        cat_name = hdu_opt[0].header.get('w_mark', 'Optical')
+        filter_name = "Red" if cat_name == "DSS" else "r-band"
+        current_y = plot_row(hdu_opt, 0, cat_name, filter_name, "a", "b", current_y, color_dir="#0033CC", color_rot="#CC0000", num_dir="I", num_rot="II", stars_df=stars_opt)
+        
+    if hdu_ir:
+        plot_row(hdu_ir, 1, "2MASS", "J-band", "c", "d", current_y, color_dir="#008000", color_rot="#800080", num_dir="III", num_rot="IV", stars_df=stars_ir)
+
     return fig
 
-import argparse
+# Main execution pipeline logic (callable directly from run_batch)
+def run_pipeline(s_name, ra_str, dec_str, pa_deg=0.0, imsize=4.0, radius=1.0, contrast=0.045, output_folder='./finder_charts/', drive_folder=None):
+    Path(output_folder).mkdir(parents=True, exist_ok=True)
+    logger = setup_logger(name="finder chart", logfile="./finder.log")
+    logger.info(f"Pipeline started for {s_name}")
+    
+    ra, dec = parse_coords(ra_str, dec_str)
+    print(f"Source: {s_name} | RA, Dec: {ra:.6f}, {dec:.6f} | PA: {pa_deg} | FOV: {imsize}'")
+    
+    download_imsize = imsize * 1.5
+    hdu_opt, hdu_ir = None, None
+    stars_opt, stars_ir = '', ''
 
+    # --- MULTITHREADING IMPLEMENTATION (Queries & Images Concurrent) ---
+    print("Downloading images and querying star catalogs in parallel...")
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        # Launch all 4 tasks concurrently
+        future_opt_img = executor.submit(get_image_fallbacks, ra, dec, s_name, download_imsize)
+        future_ir_img = executor.submit(get_image_2mass, ra, dec, s_name, download_imsize)
+        future_opt_stars = executor.submit(get_stars, ra, dec, radius, 'optical')
+        future_ir_stars = executor.submit(get_stars, ra, dec, radius, 'ir')
+        
+        # Retrieve Optical Results
+        try:
+            hdu_opt = future_opt_img.result()
+            if hdu_opt:
+                hdu_opt[0].header['wv'] = 'optical'
+                print(f"Optical image fetched successfully from {hdu_opt[0].header.get('w_mark', 'Catalog')}")
+            stars_opt = future_opt_stars.result()
+        except Exception as e:
+            print(f"Warning: Could not fetch optical image or stars. {e}")
+            
+        # Retrieve IR Results
+        try:
+            hdu_ir = future_ir_img.result()
+            if hdu_ir:
+                hdu_ir[0].header['wv'] = 'ir'
+                print("Infrared image fetched successfully from 2MASS")
+            stars_ir = future_ir_stars.result()
+        except Exception as e:
+            print(f"Warning: Could not fetch 2MASS image or stars. {e}")
+    # ------------------------------------------------------------------
 
+    if not hdu_opt and not hdu_ir:
+        raise ValueError("Could not fetch ANY images for this target.")
+            
+    print("Generating Finder Chart PDF...")
+    fig = fits2image_projected(hdu_opt, hdu_ir, stars_opt, stars_ir, pa_deg=pa_deg, imsize=imsize, radius=radius, contrast=contrast)
+    
+    output_file = Path(output_folder) / f'finder_{s_name}.pdf'
+    fig.savefig(output_file, format="pdf", bbox_inches="tight", pad_inches=0.02)
+    print(f"Success! PDF saved to: {output_file}")
+    
+    # --- GOOGLE DRIVE UPLOAD ---
+    if drive_folder:
+        upload_to_drive(output_file, drive_folder)
+
+# CLI Parser function
 def parse_args():
     parser = argparse.ArgumentParser(description="Make a finder for an object")
-
-    # Required sky position
-    parser.add_argument( "--ra", dest="ra_", required=True, help="Right Ascension (degree or sexagesimal, --ra=03:53:49.46)")
-    parser.add_argument( "--dec", dest="dec_", required=True, help="Declination (degree or sexagesimal, e.g. --dec=-11:32:57.07)")
-
-    # Optional parameters
-    parser.add_argument( "--source-name", default="", help="Source name (string)")
-    parser.add_argument( "--pa-deg", type=float, default=0.0, help="Position angle in degrees (East of North)")
-    parser.add_argument( "--imsize", type=float, default=4.0, help="Image size in arcminutes")
-    parser.add_argument( "--wv", type=str, default='optical', help="Wavelenght regime: 'optical' or 'ir' ")
+    parser.add_argument("--ra", dest="ra_", required=True, help="Right Ascension (degree or sexagesimal)")
+    parser.add_argument("--dec", dest="dec_", required=True, help="Declination (degree or sexagesimal)")
+    parser.add_argument("--s-name", default="Target", help="Source name (string)")
+    parser.add_argument("--pa-deg", type=float, default=0.0, help="Position angle in degrees (East of North)")
+    parser.add_argument("--imsize", type=float, default=4.0, help="Image size in arcminutes")
     parser.add_argument("--radius", type=float, default=1.0, help="Radius in arcminutes")
     parser.add_argument("--output-folder", type=str, default='./finder_charts/', help="output folder")
-
+    parser.add_argument("--contrast", type=float, default=0.045, help="Contrast for ZScaleInterval")
+    parser.add_argument("--drive-folder", type=str, default=None, help="Google Drive Folder ID to upload the PDF")
     return parser.parse_args()
 
-def main():
-    args = parse_args()
-    
-    # from the script
-    ra_ = args.ra_
-    dec_ = args.dec_
-    
-    # to add as variables
-    source_name = args.source_name
-    pa_deg = args.pa_deg
-    imsize = args.imsize
-    radius = args.radius
-    output_folder = args.output_folder
-    Path(output_folder).mkdir(parents=True, exist_ok=True)
-
-    logger = setup_logger(
-        name="finder chart",
-        logfile="./finder.log"
-    )
-
-    logger.info("Pipeline started")
-    logger.info([source_name, pa_deg, imsize, radius, output_folder, args.wv])
-    
-    
-    # convert to astropy coords
-    ra,dec = parse_coords(ra_,dec_)
-    
-    # Example usage
-    print(f"Source: {args.source_name}")
-    print(f"RA, Dec (deg): {ra:.6f}, {dec:.6f}")
-    print(f"PA: {args.pa_deg} deg")
-    print(f"Image size: {args.imsize} arcmin")
-    print(f"Radius: {args.radius} arcmin")
-    print(f"Output folder: {args.output_folder} ")
-   
-    output_file = output_folder + f'finder_{source_name}.pdf'
-    print(f"Output file: {output_file} ")
-    
-    # download image
-    if args.wv == 'optical':
-        hdu = get_image_fallbacks(ra,dec,source_name,imsize = imsize)
-        
-        # add wv to decide if query stars from 2mass or Gaia
-        hdu[0].header['wv'] = args.wv
-            
-    if args.wv == 'ir':
-        try:
-            hdu = get_image_2mass(ra,dec,source_name,imsize = imsize)
-        
-            if not (len(hdu) == 0):
-                im = hdu[0].data
-                cent = int(len(im) / 2)
-                width = int(0.05 * len(im))
-                test_slice = slice(cent - width, cent + width)
-                all_nans = np.isnan(im[test_slice, test_slice].flatten()).all()
-                all_zeros = (im[test_slice, test_slice].flatten() == 0).all()
-                if not (all_zeros or all_nans):
-                    print('image from 2MASS')
-                    hdu[0].header['wv'] = args.wv
-            else:
-                print("could not get 2MASS image, trying optical surveys ")
-                hdu = get_image_fallbacks(ra,dec,source_name,imsize = imsize)
-                hdu[0].header['wv'] = 'optical'
-        except:
-            print("could not get 2MASS image, trying optical surveys ")
-            hdu = get_image_fallbacks(ra,dec,source_name,imsize = imsize)
-            hdu[0].header['wv'] = 'optical'
-            
-    fig = fits2image_projected(hdu,pa_deg=pa_deg, imsize = imsize,radius = radius)
-    
-    fig.savefig(
-    output_file,
-    format="pdf",
-    bbox_inches="tight",
-    pad_inches=0.02
-    )
-
-    return
-
-
 if __name__ == "__main__":
-    main()
-    
-    # test
-    # python finder.py --source-name ZTF18aafhmpq --ra=111.12315 --dec=8.56597
-# python finder.py --source-name ZTF25acjfaoq --ra 00:23:08.83 --dec=-24:40:51.43
-
-
+    args = parse_args()
+    run_pipeline(
+        s_name=args.s_name, ra_str=args.ra_, dec_str=args.dec_, pa_deg=args.pa_deg, 
+        imsize=args.imsize, radius=args.radius, contrast=args.contrast, 
+        output_folder=args.output_folder, drive_folder=args.drive_folder
+    )
